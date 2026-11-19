@@ -1,11 +1,40 @@
 import { atom, read, update } from 'claude-code'
 import type { Register, SessionUsage } from 'claude-code'
 
-import type { TurnStat, Usage } from '../types'
+import type { Range, TurnStat, Usage, View } from '../types'
 
 const PANE = 'usage-timeline'
 const usage = atom({ plugin: 'usage-band', key: 'usage' } as const, null)
 const turns = atom({ plugin: 'usage-band', key: 'turns' } as const, [], { shape: 'turns-2' })
+/** The timeline's selection: a time filter, then how many prompts (0: the default) ending where (0: the latest). */
+const view = atom({ plugin: 'usage-band', key: 'view' } as const, { range: 'all', size: 0, end: 0 }, { shape: 'view-1' })
+
+const MIN_ZOOM = 5
+const DEFAULT_ZOOM = 40
+const RANGES: readonly { id: Range; label: string }[] = [
+  { id: '1h', label: '1h' },
+  { id: 'today', label: 'Today' },
+  { id: '24h', label: '24h' },
+  { id: '7d', label: '7d' },
+  { id: 'all', label: 'All' },
+]
+
+/** The earliest time a range keeps. */
+function rangeStart(range: Range, now: number): number {
+  if (range === '1h') return now - 3_600_000
+  if (range === '24h') return now - 86_400_000
+  if (range === '7d') return now - 7 * 86_400_000
+  if (range === 'today') { const d = new Date(now); d.setHours(0, 0, 0, 0); return d.getTime() }
+  return -Infinity
+}
+
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+
+/** The time alone for today, the date and time before that. */
+function stamp(ms: number, now: number): string {
+  const d = new Date(ms)
+  return d.toDateString() === new Date(now).toDateString() ? clock(ms) : `${MONTHS[d.getMonth()]} ${d.getDate()} ${clock(ms)}`
+}
 
 /** How a prompt row's text and a recorded prompt are compared. */
 function promptKey(text: string): string {
@@ -149,10 +178,10 @@ function toUsage(u: Pick<SessionUsage, 'context' | 'rateLimits' | 'cost'>): Usag
 const CHART_H = 360
 
 /** One prompt's tooltip: the prompt itself first, then its figures. */
-function pointTip(t: TurnStat, window: number): string {
+function pointTip(t: TurnStat, window: number, now: number): string {
   const text = (t.key || t.prompt).slice(0, 400)
   return [
-    `${clock(t.at)}  “${text}${(t.key || t.prompt).length > 400 ? '…' : ''}”`,
+    `${stamp(t.at, now)}  “${text}${(t.key || t.prompt).length > 400 ? '…' : ''}”`,
     `Context: ${short(t.before)} → ${short(t.context)} (${signed(t.delta)})${window ? `, ${Math.round((t.context / window) * 100)}% of window` : ''}`,
     `Tokens: ${short(t.input)} in / ${short(t.output)} out`,
     `Cost: ${money(t.costUsd)} · took ${duration(t.durationMs)}`,
@@ -164,7 +193,7 @@ function pointTip(t: TurnStat, window: number): string {
  * pane's own width so its text is never scaled down. Each prompt has a full-height hover column:
  * it lights the column and shows the prompt and its figures as a tooltip.
  */
-function chartSvg(list: readonly TurnStat[], window: number, W: number): string {
+function chartSvg(list: readonly TurnStat[], window: number, W: number, now: number): string {
   const H = CHART_H, L = 64, R = 20, T = 18, B = 56
   const top = Math.max(...list.map(t => t.context), 1) * 1.1
   const plot = W - L - R
@@ -181,17 +210,17 @@ function chartSvg(list: readonly TurnStat[], window: number, W: number): string 
   const points = list
     .map((t, i) => {
       const h = Math.abs(y(0) - y(Math.abs(t.delta)))
-      return `<g class="pt"><title>${escape(pointTip(t, window))}</title>` +
+      return `<g class="pt"><title>${escape(pointTip(t, window, now))}</title>` +
         `<rect class="hit" x="${x(i) - col / 2}" y="${T}" width="${col}" height="${H - T - B}"/>` +
         `<line class="guide" x1="${x(i)}" x2="${x(i)}" y1="${T}" y2="${H - B}"/>` +
         `<rect class="${t.delta >= 0 ? 'bar' : 'bar neg'}" x="${x(i) - bw / 2}" y="${y(0) - h}" width="${bw}" height="${h}"/>` +
         `<circle class="dot" cx="${x(i)}" cy="${y(t.context)}" r="4"/></g>`
     })
     .join('')
-  const step = Math.max(1, Math.ceil(list.length / Math.max(2, Math.floor(plot / 70))))
+  const step = Math.max(1, Math.ceil(list.length / Math.max(2, Math.floor(plot / 100))))
   const xs = list
     .map((t, i) => (i % step === 0 || i === list.length - 1
-      ? `<text x="${x(i)}" y="${H - B + 20}" text-anchor="middle">${clock(t.at)}</text>` : ''))
+      ? `<text x="${x(i)}" y="${H - B + 20}" text-anchor="middle">${stamp(t.at, now)}</text>` : ''))
     .join('')
   return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${H}" width="${W}" height="${H}">` +
     `<style>text{font:13px system-ui,-apple-system,"Segoe UI",sans-serif;fill:#9a9a9a}` +
@@ -481,33 +510,64 @@ export const register: Register = on => {
     if (list.length === 0) {
       return <Text dimColor>No prompts measured yet. The timeline fills in after each reply.</Text>
     }
+    const { Button } = els
     const u = await read($, usage)
     const window = u?.window ?? 200_000
-    const lastCtx = list.at(-1)?.context ?? 0
-    const total = list.reduce(
-      (s, t) => ({ input: s.input + t.input, output: s.output + t.output, cost: s.cost + (t.costUsd ?? 0) }),
-      { input: 0, output: 0, cost: 0 },
+    const now = await $.clock.now()
+    const v = await read($, view)
+
+    // 1. The time filter, 2. the zoom (how many prompts) and pan (which ones) within it.
+    const inRange = list.filter(t => t.at >= rangeStart(v.range, now))
+    const n = inRange.length
+    const size = n === 0 ? 0 : Math.min(n, Math.max(MIN_ZOOM, v.size || Math.min(n, DEFAULT_ZOOM)))
+    const end = n === 0 ? 0 : Math.min(n, Math.max(size, v.end || n))
+    const shown = inRange.slice(end - size, end)
+    const step = Math.max(1, Math.floor(size / 2))
+    const set = (fn: (cur: View) => View) => void update($, view, fn)
+
+    const total = shown.reduce(
+      (s, t) => ({ input: s.input + t.input, output: s.output + t.output, cost: s.cost + (t.costUsd ?? 0), unknown: s.unknown || t.costUsd === null }),
+      { input: 0, output: 0, cost: 0, unknown: false },
     )
-    // Prompts rebuilt from the transcript carry no cost: the session's own total covers them all.
-    const cost = u?.costUsd ?? total.cost
-    const rows = list.slice(-Math.max(5, (e.viewport?.rows ?? 40) - 20)).reverse()
+    const span = shown.length ? `${stamp(shown[0]!.at, now)} – ${stamp(shown.at(-1)!.at, now)}` : ''
+    const lastCtx = list.at(-1)?.context ?? 0
     // The pane's width in CSS pixels (about 8 per column), so the chart is drawn 1:1 and its text stays readable.
     const chartW = Math.max(420, Math.min(1600, Math.round((e.props.bodyColumns ?? 90) * 8) - 8))
-    const chart = e.surface !== 'terminal' && 'Svg' in els
-      ? <els.Svg source={chartSvg(list, window, chartW)} alt={`Context grew to ${short(lastCtx)} tokens over ${list.length} prompts`} width={chartW} height={CHART_H} isInteractive />
-      : <Text>{sparkline(list)}</Text>
+    const chart = shown.length === 0
+      ? <Text dimColor>No prompts in this period.</Text>
+      : e.surface !== 'terminal' && 'Svg' in els
+        ? <els.Svg source={chartSvg(shown, window, chartW, now)} alt={`Context over ${shown.length} prompts, ${span}`} width={chartW} height={CHART_H} isInteractive />
+        : <Text>{sparkline(shown)}</Text>
+    const rows = shown.slice(-Math.max(5, (e.viewport?.rows ?? 40) - 24)).reverse()
 
     return (
       <Box flexDirection="column" gap={1}>
         <Text>
-          {`${list.length} prompts · context now ${short(lastCtx)} of ${short(window)} · ${short(total.input)} in / ${short(total.output)} out · ${money(cost)}`}
+          {`Session: ${list.length} prompts · context now ${short(lastCtx)} of ${short(window)} · ${money(u?.costUsd ?? null)}`}
+        </Text>
+        <Box flexDirection="row" gap={1} flexWrap="wrap">
+          {RANGES.map(r => (
+            <Button key={`range-${r.id}`} label={r.label} variant={v.range === r.id ? 'primary' : 'secondary'}
+              onPress={() => set(() => ({ range: r.id, size: 0, end: 0 }))} />
+          ))}
+          <Text dimColor>{'  │  '}</Text>
+          <Button key="zoom-out" label="−" onPress={() => set(c => ({ ...c, size: Math.min(n, size * 2) }))} />
+          <Button key="zoom-in" label="+" onPress={() => set(c => ({ ...c, size: Math.max(MIN_ZOOM, Math.round(size / 2)), end: c.end }))} />
+          <Button key="pan-left" label="◀" onPress={() => set(c => ({ ...c, size, end: Math.max(size, end - step) }))} />
+          <Button key="pan-right" label="▶" onPress={() => set(c => ({ ...c, size, end: end + step >= n ? 0 : end + step }))} />
+          <Button key="latest" label="Latest" onPress={() => set(c => ({ ...c, end: 0 }))} />
+        </Box>
+        <Text dimColor>
+          {n === 0
+            ? 'No prompts in this period.'
+            : `Prompts ${end - size + 1}–${end} of ${n}${v.range === 'all' ? '' : ' in this period'} · ${span} · ${short(total.input)} in / ${short(total.output)} out${total.unknown ? '' : ` · ${money(total.cost)}`}`}
         </Text>
         {chart}
         <Box flexDirection="column">
-          <Text bold>{'Time   Context    Change  In / out          Cost    Took  Prompt'}</Text>
+          <Text bold>{'When          Context    Change  In / out          Cost    Took  Prompt'}</Text>
           {rows.map(t => (
             <Text key={String(t.at)} wrap="truncate">
-              {`${clock(t.at)}  ${short(t.context).padStart(7)}  ${signed(t.delta).padStart(8)}  ${`${short(t.input)} / ${short(t.output)}`.padEnd(15)}  ${money(t.costUsd).padStart(6)}  ${duration(t.durationMs).padStart(6)}  ${t.prompt}`}
+              {`${stamp(t.at, now).padEnd(12)}  ${short(t.context).padStart(7)}  ${signed(t.delta).padStart(8)}  ${`${short(t.input)} / ${short(t.output)}`.padEnd(15)}  ${money(t.costUsd).padStart(6)}  ${duration(t.durationMs).padStart(6)}  ${t.prompt}`}
             </Text>
           ))}
         </Box>

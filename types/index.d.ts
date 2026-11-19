@@ -16,8 +16,12 @@ export type TurnStat = {
   durationMs: number
 }
 
+export type Range = '1h' | 'today' | '24h' | '7d' | 'all'
+/** The timeline's selection: a time filter, then a zoom (0: default) ending at a prompt (0: the latest). */
+export type View = { range: Range; size: number; end: number }
+
 declare module 'claude-code' {
   interface PluginState {
-    'usage-band': { usage: Usage | null; turns: Shaped<TurnStat[]> }
+    'usage-band': { usage: Usage | null; turns: Shaped<TurnStat[]>; view: Shaped<View> }
   }
 }

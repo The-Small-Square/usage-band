@@ -26,6 +26,11 @@ session's context grew prompt by prompt (bars: what each prompt added; red when 
 after compaction) and a table of every prompt. Hover a point on the chart for a tooltip with that
 prompt's text and figures. In a terminal the chart is a text sparkline.
 
+Above the chart: time filters (1h, Today, 24h, 7d, All), then − / + to zoom out or in on the
+number of prompts shown (40 at first), ◀ / ▶ to pan through them, and Latest to jump back to the
+newest. The line under the controls says which prompts are shown and their totals; the table
+below follows the same selection.
+
 Everything updates after each reply. Nothing is sent anywhere; history lives in the session.
 When a session starts, prompts sent before the mod was running are rebuilt from the session's
 own transcript (tokens, context and timing; the transcript records no cost, so those show —).

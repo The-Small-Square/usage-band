@@ -102,3 +102,50 @@ test('a prompt shows in the band and the timeline', async ($, on) => {
   expect(chart?.source).toContain('font:13px')
   await pane.unmount()
 })
+
+test('the timeline zooms, pans and filters by time', async ($, on) => {
+  let now = Date.UTC(2026, 10, 18, 8, 0)
+  let tokens = 1_000
+  on('command.register', () => ({ value: { command: 'usage-timeline' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('session.usage', () => ({
+    value: { startedAt: 0, context: { tokens, window: 1_000_000, percent: 1 }, rateLimits: [], cost: { usd: 1 } },
+  }))
+  on('clock.now', () => ({ value: now }))
+  on('ui.render', ($, e) => { const { Text } = $.ui.resolve(e); return <Text>engine</Text> })
+  on('prompt.submit', (_, e) => ({ text: e.text }))
+  on('turn.complete', () => ({ text: 'done' }))
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  // 12 prompts, ten minutes apart; the last two within the final hour.
+  for (let i = 1; i <= 12; i++) {
+    await $.prompt.submit({ text: `prompt ${i}`, origin: { kind: 'composer' } } as unknown as Parameters<typeof $.prompt.submit>[0])
+    tokens += 1_000
+    now += 10 * 60_000
+    await $.turn.complete({ answer: 'ok', durationMs: 1_000, isAborted: false, turnId: `t${i}`, reason: 'answer' })
+  }
+  now += 41 * 60_000
+
+  const pane = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const range = async () => (await pane.find({ type: 'Text', text: /^Prompts / }))?.text ?? ''
+  expect(await range()).toStartWith('Prompts 1–12 of 12')
+
+  await pane.press({ key: 'zoom-in' })
+  expect(await range()).toStartWith('Prompts 7–12 of 12')
+  await pane.press({ key: 'pan-left' })
+  expect(await range()).toStartWith('Prompts 4–9 of 12')
+  await pane.press({ key: 'zoom-out' })
+  expect(await range()).toStartWith('Prompts 1–12 of 12')
+  await pane.press({ key: 'zoom-in' })
+  await pane.press({ key: 'latest' })
+  expect(await range()).toStartWith('Prompts 7–12 of 12')
+
+  await pane.press({ key: 'range-1h' })
+  expect(await range()).toStartWith('Prompts 1–2 of 2 in this period')
+  expect((await pane.find({ type: 'Text', text: /prompt 12$/ }))?.text).toContain('+1k')
+  expect(await pane.find({ type: 'Text', text: /prompt 3$/ })).toBeUndefined()
+  await pane.press({ key: 'range-all' })
+  expect(await range()).toStartWith('Prompts 1–12 of 12')
+  await pane.unmount()
+})
