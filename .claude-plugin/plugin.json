@@ -1,0 +1,1 @@
+{ "name": "usage-band", "version": "0.6.1", "description": "Session context use, plan limits and cost above the prompt; per-prompt stats in a hover card on each prompt; a token timeline pane", "types": "./types/index.d.ts" }
