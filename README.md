@@ -26,8 +26,10 @@ session's context grew prompt by prompt (bars: what each prompt added; red when 
 after compaction) and a table of every prompt. Hover a point on the chart for a tooltip with that
 prompt's text and figures. In a terminal the chart is a text sparkline.
 
-Everything updates after each reply. Nothing is sent anywhere; history lives in the session and
-starts when the mod first loads in it. A prompt sent twice with the same text shows the latest stats.
+Everything updates after each reply. Nothing is sent anywhere; history lives in the session.
+When a session starts, prompts sent before the mod was running are rebuilt from the session's
+own transcript (tokens, context and timing; the transcript records no cost, so those show —).
+A prompt sent twice with the same text shows the latest stats.
 
 ## Install
 

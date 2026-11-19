@@ -11,7 +11,8 @@ export type TurnStat = {
   delta: number
   input: number
   output: number
-  costUsd: number
+  /** null for a prompt rebuilt from the transcript, which records no cost. */
+  costUsd: number | null
   durationMs: number
 }
 

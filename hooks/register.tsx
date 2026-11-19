@@ -24,8 +24,93 @@ function signed(n: number): string {
   return n >= 0 ? `+${short(n)}` : short(n)
 }
 
-function money(usd: number): string {
+/** `null`: a prompt rebuilt from the transcript, which records no cost. */
+function money(usd: number | null): string {
+  if (usd === null) return '—'
   return usd < 0.01 ? '<$0.01' : `$${usd.toFixed(2)}`
+}
+
+/** The Claude config folder (`~/.claude`, or wherever CLAUDE_CONFIG_DIR points) the plugin runs from. */
+function configDir(pluginRoot: string): string | null {
+  const m = /^(.*?[\\/]\.claude)(?=[\\/])/.exec(pluginRoot)
+  return m?.[1] ?? null
+}
+
+type HistoryLine = {
+  type?: string
+  isMeta?: boolean
+  isSidechain?: boolean
+  isCompactSummary?: boolean
+  timestamp?: string
+  origin?: { kind?: string }
+  message?: {
+    id?: string
+    content?: string | { type?: string; text?: string }[]
+    usage?: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number }
+  }
+}
+
+/** The text a user line typed, or null for a tool result, a meta line or a compaction summary. */
+function promptText(o: HistoryLine): string | null {
+  if (o.type !== 'user' || o.isMeta || o.isSidechain || o.isCompactSummary) return null
+  const c = o.message?.content
+  const text = typeof c === 'string' ? c : (c ?? []).filter(b => b.type === 'text').map(b => b.text ?? '').join(' ')
+  if (!text.trim() || /^\s*<(local-command|command-name|command-message)/.test(text)) return null
+  return text
+}
+
+/**
+ * Rebuilds the session's prompts from its transcript, streamed line by line so a large file is
+ * never held whole: each prompt's tokens summed over its replies' API responses (each counted
+ * once), and the context after it from its last response. Cost is not in the transcript.
+ */
+async function rebuildHistory(spawn: (argv: readonly string[]) => AsyncIterable<{ stream: string; text: string }>, path: string): Promise<TurnStat[]> {
+  const argv = path.includes('\\') ? ['cmd', '/d', '/c', 'type', path] : ['cat', path]
+  const out: TurnStat[] = []
+  let cur: { start: number; end: number; text: string; human: boolean; input: number; output: number; context: number; seen: Set<string> } | null = null
+  let prev = 0
+  const close = () => {
+    if (!cur || cur.seen.size === 0) return
+    const key = cur.human ? promptKey(cur.text) : ''
+    out.push({
+      at: cur.end, key, prompt: cur.human ? key.slice(0, 80) : '(background event)',
+      before: prev, context: cur.context, delta: cur.context - prev,
+      input: cur.input, output: cur.output, costUsd: null, durationMs: Math.max(0, cur.end - cur.start),
+    })
+    prev = cur.context
+  }
+  const take = (line: string) => {
+    if (!line.includes('"type":"user"') && !line.includes('"type":"assistant"')) return
+    let o: HistoryLine
+    try { o = JSON.parse(line) as HistoryLine } catch { return }
+    const at = o.timestamp ? Date.parse(o.timestamp) : NaN
+    const text = promptText(o)
+    if (text !== null) {
+      close()
+      cur = { start: at, end: at, text, human: (o.origin?.kind ?? 'human') === 'human', input: 0, output: 0, context: prev, seen: new Set() }
+      return
+    }
+    if (o.type !== 'assistant' || o.isSidechain || !cur) return
+    if (!Number.isNaN(at)) cur.end = at
+    const id = o.message?.id
+    const u = o.message?.usage
+    if (!id || !u || cur.seen.has(id)) return
+    cur.seen.add(id)
+    const inp = (u.input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0)
+    cur.input += inp
+    cur.output += u.output_tokens ?? 0
+    cur.context = inp + (u.output_tokens ?? 0)
+  }
+  let rest = ''
+  for await (const piece of spawn(argv)) {
+    if (piece.stream !== 'stdout' || !piece.text) continue
+    const lines = (rest + piece.text).split('\n')
+    rest = lines.pop() ?? ''
+    for (const l of lines) take(l)
+  }
+  if (rest) take(rest)
+  close()
+  return out
 }
 
 function duration(ms: number): string {
@@ -204,8 +289,39 @@ export const register: Register = on => {
     await $.command.register({ name: 'usage-timeline', description: "Show how this session's tokens grew, prompt by prompt" })
     const u = await $.session.usage()
     await update($, usage, () => toUsage(u))
+    // Fill the timeline with the prompts sent before the mod was running, rebuilt from the
+    // session's transcript. What the mod recorded live wins: only older prompts are added.
+    void (async () => {
+      const dir = configDir($.plugin.root)
+      if (!dir) return
+      const id = await $.session.id()
+      const projects = `${dir}/projects`
+      const folders = await $.fs.list(projects).catch(() => [])
+      let path: string | null = null
+      for (const f of folders) {
+        if (f.kind !== 'dir') continue
+        const candidate = `${projects}/${f.name}/${id}.jsonl`
+        if (await $.fs.exists(candidate)) { path = candidate; break }
+      }
+      if (!path) return
+      const native = dir.includes('\\') ? path.replace(/\//g, '\\') : path
+      const spawn = (argv: readonly string[]) => {
+        const stream = $.process.spawn({ argv })
+        return (async function* () {
+          for await (const piece of stream) yield piece as { stream: string; text: string }
+        })()
+      }
+      const history = await rebuildHistory(spawn, native)
+      if (history.length === 0) return
+      await update($, turns, live => {
+        const firstLive = live[0]?.at ?? Infinity
+        const older = history.filter(h => h.at < firstLive - 1000)
+        return [...older, ...live].slice(-500)
+      })
+    })().catch(() => undefined)
     return result
   })
+
 
   on('command.run', { command: 'usage-timeline' }, async $ => {
     await $.ui.open({ id: PANE, title: 'Token timeline' })
@@ -369,9 +485,11 @@ export const register: Register = on => {
     const window = u?.window ?? 200_000
     const lastCtx = list.at(-1)?.context ?? 0
     const total = list.reduce(
-      (s, t) => ({ input: s.input + t.input, output: s.output + t.output, cost: s.cost + t.costUsd }),
+      (s, t) => ({ input: s.input + t.input, output: s.output + t.output, cost: s.cost + (t.costUsd ?? 0) }),
       { input: 0, output: 0, cost: 0 },
     )
+    // Prompts rebuilt from the transcript carry no cost: the session's own total covers them all.
+    const cost = u?.costUsd ?? total.cost
     const rows = list.slice(-Math.max(5, (e.viewport?.rows ?? 40) - 20)).reverse()
     // The pane's width in CSS pixels (about 8 per column), so the chart is drawn 1:1 and its text stays readable.
     const chartW = Math.max(420, Math.min(1600, Math.round((e.props.bodyColumns ?? 90) * 8) - 8))
@@ -382,7 +500,7 @@ export const register: Register = on => {
     return (
       <Box flexDirection="column" gap={1}>
         <Text>
-          {`${list.length} prompts · context now ${short(lastCtx)} of ${short(window)} · ${short(total.input)} in / ${short(total.output)} out · ${money(total.cost)}`}
+          {`${list.length} prompts · context now ${short(lastCtx)} of ${short(window)} · ${short(total.input)} in / ${short(total.output)} out · ${money(cost)}`}
         </Text>
         {chart}
         <Box flexDirection="column">
